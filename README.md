@@ -100,7 +100,11 @@ git clone <repository-url>
 cd data-curation
 ```
 
-### 2. 가상환경 생성
+### 2. 가상환경 생성 (venv 또는 conda)
+
+아래 두 방법 중 하나를 선택해서 사용하면 됩니다.
+
+#### 방법 A: `venv`
 
 macOS / Linux / WSL:
 
@@ -114,6 +118,20 @@ Windows PowerShell:
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
+```
+
+#### 방법 B: `conda`
+
+```bash
+conda create -n data-curation python=3.10 -y
+conda activate data-curation
+```
+
+환경 제거(선택):
+
+```bash
+conda deactivate
+conda env remove -n data-curation
 ```
 
 ### 3. 의존성 설치
