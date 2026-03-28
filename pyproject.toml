@@ -5,14 +5,33 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "data-curation"
 version = "0.1.0"
-description = "Data curation utilities"
+description = "Data curation utilities for robot trajectory segmentation"
 requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+full = [
+    "scipy",
+    "ruptures",
+    "pandas",
+    "pyarrow",
+    "pyyaml",
+    "huggingface_hub",
+]
+# pinocchio (required for FK) must be installed via conda, not pip:
+#   conda install -c conda-forge pinocchio
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"segmentation.configs" = ["*.yaml"]
 
 [project.scripts]
 segmentation-cli = "segmentation.cli:main"

@@ -287,6 +287,64 @@ def load_episode(episode_ref: EpisodeRef) -> EpisodeTimeseries:
     )
 
 
+def compute_episode_fk(
+    episode_ts: EpisodeTimeseries,
+    model: Any,
+    data: Any,
+    name_to_q_idx: dict[str, int],
+    ee_frame: str,
+    joint_names: tuple[str, ...] | None = None,
+    gripper_mapping: dict[str, int] | None = None,
+) -> EpisodeTimeseries:
+    """Compute FK for an episode and return an updated :class:`EpisodeTimeseries`.
+
+    The returned object has ``ee_pose`` set to an ``(N, 7)`` array with columns
+    ``[x, y, z, qx, qy, qz, qw]`` and ``needs_fk=False``.  This layout is
+    compatible with ``features.build_features()``'s ``"cartesian"`` key
+    (``c[:, :3]`` for position, ``c[:, 3:7]`` for quaternion).
+
+    Parameters
+    ----------
+    episode_ts:
+        Episode loaded by :func:`load_episode` that has ``needs_fk=True``.
+    model, data:
+        Pinocchio model and data objects from
+        ``segmentation.kinematics.load_robot_model()``.
+    name_to_q_idx:
+        Joint name → q-vector index map from
+        ``segmentation.kinematics.build_joint_index_map()``.
+    ee_frame:
+        URDF frame name of the end-effector (e.g. ``"ee_right"``).
+    joint_names, gripper_mapping:
+        Robot-specific constants; defaults to RB-Y1 values.  See
+        ``segmentation.kinematics.build_q_from_state()``.
+
+    Raises
+    ------
+    ValueError
+        If ``episode_ts.needs_fk`` is ``False`` (FK data is already present).
+    ImportError
+        If pinocchio is not installed.
+    """
+    if not episode_ts.needs_fk:
+        raise ValueError(
+            "episode_ts.needs_fk is False — Cartesian pose is already available."
+        )
+
+    from . import kinematics  # lazy import: keeps data_loader pinocchio-free at module load
+    import dataclasses
+    import numpy as np
+
+    joint_array = np.asarray(episode_ts.joint_states, dtype=float)  # (N, D)
+    positions, rot_matrices, _ = kinematics.compute_fk_trajectory(
+        model, data, name_to_q_idx, joint_array, ee_frame, joint_names, gripper_mapping,
+    )
+    quaternions = kinematics.fk_to_quaternion(rot_matrices)  # (N, 4) xyzw
+    ee_pose = np.hstack([positions, quaternions])            # (N, 7)
+
+    return dataclasses.replace(episode_ts, ee_pose=ee_pose, needs_fk=False)
+
+
 def save_sampling_output(output: str | Path, sampled_episodes: Iterable[EpisodeRef]) -> Path:
     """Persist sampled episode ids for reproducibility.
 
