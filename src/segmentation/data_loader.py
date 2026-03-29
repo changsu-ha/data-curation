@@ -108,7 +108,13 @@ def list_episodes(dataset_path: str | Path) -> list[EpisodeRef]:
     """
 
     root = Path(dataset_path).expanduser().resolve()
-    metadata_rows = _resolve_episode_metadata(root)
+    try:
+        metadata_rows = _resolve_episode_metadata(root)
+    except FileNotFoundError:
+        # Shared-parquet LeRobot datasets may not ship episodes.jsonl/json.
+        from .lerobot_adapter import inspect_dataset, list_episode_refs
+
+        return list_episode_refs(root, inspect_dataset(root))
 
     episodes: list[EpisodeRef] = []
     for idx, row in enumerate(metadata_rows):

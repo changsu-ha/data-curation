@@ -10,6 +10,8 @@ from .data_loader import (
     save_sampling_output,
     uniform_sample_episodes,
 )
+from .features import FeatureBuildConfig, build_features, normalize_modality_name
+from .lerobot_adapter import DatasetSchema, inspect_dataset, list_episode_refs, load_episode_arrays
 from .pipeline import run_pipeline
 from .segmenter import (
     Segment,
@@ -38,6 +40,15 @@ __all__ = [
     "load_episode",
     "save_sampling_output",
     "uniform_sample_episodes",
+    # features
+    "FeatureBuildConfig",
+    "build_features",
+    "normalize_modality_name",
+    # lerobot adapter
+    "DatasetSchema",
+    "inspect_dataset",
+    "list_episode_refs",
+    "load_episode_arrays",
     # pipeline
     "run_pipeline",
     # segmenter

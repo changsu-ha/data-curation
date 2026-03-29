@@ -15,4 +15,8 @@ dependencies:
   - pip:
     - huggingface_hub
     - ruptures
+    - fast-ticc        # Recurring primitive discovery (TICC)
+    - sktime           # sktime segmentation benchmark
+    - scikit-learn     # silhouette_score for TICC auto-k
+    - pytest           # testing
     - -e .             # Install the data-curation package itself in editable mode

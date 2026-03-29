@@ -1,0 +1,100 @@
+# Pipeline configuration for run_lerobot_segmentation.py
+# All hyperparameters are either inferred from data (marked "null → inferred")
+# or documented with the rationale for why they must be configurable.
+
+# ---------------------------------------------------------------------------
+# Dataset / sampling
+# ---------------------------------------------------------------------------
+dataset:
+  n_episodes: 5        # how many episodes to process (0 = schema-only)
+  seed: 42             # reproducibility
+  local: true          # true = dataset_path is a local directory
+  missing_values: ffill_drop  # ffill_drop | none
+
+# ---------------------------------------------------------------------------
+# Feature construction
+# ---------------------------------------------------------------------------
+features:
+  # dt: null → inferred as median(np.diff(timestamps)) from each episode.
+  # Set to a float (e.g. 0.033) to force a fixed sampling rate.
+  dt: null
+
+  smoothing: savgol    # savgol | lowpass | none
+  normalize: mad       # mad | iqr | none
+
+  # Modalities to run segmentation on.
+  # "joint"         → joint position/velocity/acceleration
+  # "cartesian" → EE position + orientation (requires FK or ee_pose in dataset)
+  # "joint_command" → joint position/velocity/acceleration + command + command error
+  # "ablation"      → deprecated alias of joint_command
+  modalities:
+    - joint
+    - cartesian        # will be skipped if no URDF and no ee_pose in dataset
+
+  # Modality weights applied after normalisation (1.0 = no scaling)
+  modality_weights:
+    joint: 1.0
+    cartesian: 1.0
+    command: 1.0
+
+# ---------------------------------------------------------------------------
+# Ruptures change-point detection
+# ---------------------------------------------------------------------------
+ruptures:
+  model: rbf           # rbf | l2 | l1 | cosine
+  min_size: 5          # minimum segment length in frames
+  jump: 1              # sub-sampling step (1 = exact, higher = faster)
+
+  # penalty: "auto" → elbow-based auto-selection from penalty_range.
+  # Set to a float to use a fixed penalty (disables auto-selection).
+  penalty: auto
+  auto_method: elbow   # elbow is the only implemented method
+
+  # Log-spaced search range for auto penalty selection.
+  # Wider range → more candidates → slower but more robust.
+  # Rationale: these cover typical ruptures RBF penalty scales.
+  penalty_range: [0.5, 200.0]
+  n_penalty_steps: 40
+
+  # Comparison algorithm (runs in addition to PELT for benchmarking)
+  compare_algorithm: binseg
+  max_n_bkps: 30       # cap for binseg when using predicted n_bkps
+
+# ---------------------------------------------------------------------------
+# fast_ticc primitive discovery
+# ---------------------------------------------------------------------------
+ticc:
+  window_size: 10      # frames per TICC window; should match segment granularity
+
+  # n_clusters: "auto" → silhouette search over 2..max_k
+  # Set to an integer to use a fixed number of clusters.
+  n_clusters: auto
+  max_k: 10            # upper bound for auto search
+
+  # Sparsity regularisation: higher → sparser inverse covariance graphs.
+  # Rationale: 0.11 is the fast_ticc default; adjust if segments are over-split.
+  lambda_: 0.11
+
+  # Temporal coherence weight: higher → smoother cluster assignments.
+  # Rationale: 400 is the fast_ticc default for robot tasks.
+  beta: 400.0
+
+  max_iter: 100
+  random_state: 42
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+evaluation:
+  # Two boundaries within this many frames are considered "in agreement".
+  # Rationale: at 30 Hz, 5 frames ≈ 167 ms — typical human annotation jitter.
+  boundary_tolerance_frames: 5
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+output:
+  plots: true
+  csv: true
+  json: true
+  report: true

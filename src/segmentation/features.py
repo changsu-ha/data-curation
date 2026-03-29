@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, MutableMapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional
 
 import numpy as np
 
@@ -18,6 +18,9 @@ except Exception:  # pragma: no cover
 
 Array = np.ndarray
 
+_MODALITY_ALIASES = {"ablation": "joint_command"}
+_VALID_MODALITIES = {"joint", "cartesian", "joint_command"}
+
 
 @dataclass
 class FeatureBuildConfig:
@@ -33,6 +36,17 @@ class FeatureBuildConfig:
     modality_weights: Optional[Mapping[str, float]] = None
 
 
+def normalize_modality_name(modality: str) -> str:
+    """Normalize modality aliases and validate the final name."""
+    normalized = _MODALITY_ALIASES.get(modality.strip().lower(), modality.strip().lower())
+    if normalized not in _VALID_MODALITIES:
+        raise ValueError(
+            f"unknown modality: {modality!r}; expected one of "
+            f"{sorted(_VALID_MODALITIES | set(_MODALITY_ALIASES))}"
+        )
+    return normalized
+
+
 # -----------------------------
 # preprocessing utilities
 # -----------------------------
@@ -40,11 +54,13 @@ def resample_fixed_dt(
     timestamps: Array,
     signals: Mapping[str, Array],
     dt: float,
-) -> Tuple[Array, Dict[str, Array]]:
+) -> tuple[Array, Dict[str, Array]]:
     """Resample all signals to a fixed step using linear interpolation."""
     t = np.asarray(timestamps, dtype=float)
     if t.ndim != 1 or len(t) < 2:
         raise ValueError("timestamps must be a 1D array with at least 2 elements")
+    if not np.all(np.diff(t) > 0):
+        raise ValueError("timestamps must be strictly increasing")
 
     t_new = np.arange(t[0], t[-1] + 0.5 * dt, dt, dtype=float)
     out: Dict[str, Array] = {}
@@ -86,7 +102,13 @@ def smooth_signal(
         window = min(window, x.shape[0] - (1 - x.shape[0] % 2))
         if window <= savgol_polyorder:
             return _moving_average(x, k=5)
-        return savgol_filter(x, window_length=window, polyorder=savgol_polyorder, axis=0, mode="interp")
+        return savgol_filter(
+            x,
+            window_length=window,
+            polyorder=savgol_polyorder,
+            axis=0,
+            mode="interp",
+        )
 
     if method == "lowpass":
         if butter is None or filtfilt is None or x.shape[0] < 8:
@@ -115,88 +137,216 @@ def unwrap_orientation(rotvec: Array) -> Array:
 # -----------------------------
 # feature builder
 # -----------------------------
-def build_features(sample: Mapping[str, Any], config: Optional[FeatureBuildConfig] = None) -> Dict[str, Any]:
+def build_features(
+    sample: Mapping[str, Any],
+    modality: str | FeatureBuildConfig | None = None,
+    config: Optional[FeatureBuildConfig] = None,
+) -> Dict[str, Any]:
     """
-    Build segmentation features from one sample.
+    Build segmentation features from one sample for a single modality.
 
     Returns a dictionary with:
-      - feature_matrix: [T, D]
+      - matrix: [T, D]
+      - feature_names: ordered feature channel names
       - timestamps: [T]
-      - aux_signals: original + intermediate signals
+      - source_channels: original signals used for the modality
+
+    Compatibility:
+      - ``build_features(sample, config)`` is still accepted.
+      - ``feature_matrix`` is returned as an alias of ``matrix``.
     """
+    if isinstance(modality, FeatureBuildConfig):
+        config = modality
+        modality = None
+
     cfg = config or FeatureBuildConfig()
+    resolved_modality = (
+        normalize_modality_name(modality)
+        if isinstance(modality, str)
+        else _infer_modality(sample)
+    )
 
-    t = np.asarray(_pick(sample, "timestamps", "t", "time"), dtype=float)
-    q = _to_2d(np.asarray(_pick(sample, "q", "joint_pos"), dtype=float))
+    timestamps = np.asarray(_pick(sample, "timestamps", "t", "time"), dtype=float)
+    dt = _resolve_dt(timestamps, cfg.dt)
 
-    q_cmd_raw = sample.get("q_cmd")
-    q_cmd = _to_2d(np.asarray(q_cmd_raw, dtype=float)) if q_cmd_raw is not None else np.zeros_like(q)
-
-    pos = _extract_position(sample)
-    quat = _extract_quaternion(sample)
-    rotvec = quat_to_rotvec(quat)
-    rotvec = unwrap_orientation(rotvec)
-
-    grip = _extract_gripper(sample)
-
-    dt = cfg.dt if cfg.dt is not None else float(np.median(np.diff(t)))
-    signals = {"q": q, "q_cmd": q_cmd, "pos": pos, "rotvec": rotvec, "grip": grip}
-    t_rs, rs = resample_fixed_dt(t, signals, dt)
-
-    q_f = smooth_signal(rs["q"], dt, cfg.smoothing, cfg.savgol_window, cfg.savgol_polyorder, cfg.lowpass_cutoff_hz, cfg.lowpass_order)
-    q_cmd_f = smooth_signal(rs["q_cmd"], dt, cfg.smoothing, cfg.savgol_window, cfg.savgol_polyorder, cfg.lowpass_cutoff_hz, cfg.lowpass_order)
-    pos_f = smooth_signal(rs["pos"], dt, cfg.smoothing, cfg.savgol_window, cfg.savgol_polyorder, cfg.lowpass_cutoff_hz, cfg.lowpass_order)
-    rot_f = smooth_signal(rs["rotvec"], dt, cfg.smoothing, cfg.savgol_window, cfg.savgol_polyorder, cfg.lowpass_cutoff_hz, cfg.lowpass_order)
-    grip_f = smooth_signal(rs["grip"], dt, cfg.smoothing, cfg.savgol_window, cfg.savgol_polyorder, cfg.lowpass_cutoff_hz, cfg.lowpass_order)
-
-    dq = np.gradient(q_f, dt, axis=0)
-    ddq = np.gradient(dq, dt, axis=0)
-    q_err = q_cmd_f - q_f
-
-    dpos = np.gradient(pos_f, dt, axis=0)
-    ddpos = np.gradient(dpos, dt, axis=0)
-    drot = np.gradient(rot_f, dt, axis=0)
-    ddrot = np.gradient(drot, dt, axis=0)
-
-    grip_ratio = np.clip(grip_f, 0.0, 1.0)
-    grip_binary = (grip_ratio > 0.5).astype(float)
-    grip_event = np.abs(np.gradient(grip_binary.squeeze(-1) if grip_binary.ndim == 2 else grip_binary, axis=0, edge_order=1))
-    grip_event = grip_event.reshape(-1, 1)
-    grip_binary = _to_2d(grip_binary)
-    grip_ratio = _to_2d(grip_ratio)
-
-    modalities = {
-        "joint": np.concatenate([q_f, dq, ddq, q_cmd_f, q_err], axis=1),
-        "cartesian": np.concatenate([pos_f, rot_f, dpos, ddpos, drot, ddrot], axis=1),
-        "gripper": np.concatenate([grip_binary, grip_ratio, grip_event], axis=1),
-    }
-
-    normalized = _normalize_and_weight(modalities, cfg.normalize, cfg.modality_weights)
-    feature_matrix = np.concatenate([normalized["joint"], normalized["cartesian"], normalized["gripper"]], axis=1)
-
-    aux = {
-        "original": {
-            "timestamps": t,
-            "q": q,
-            "q_cmd": q_cmd,
-            "position": pos,
-            "quaternion": quat,
-            "gripper": grip,
-        },
-        "resampled": {
-            "timestamps": t_rs,
-            "q": q_f,
-            "q_cmd": q_cmd_f,
-            "position": pos_f,
-            "rotvec": rot_f,
-            "gripper": grip_f,
-        },
-    }
+    if resolved_modality == "joint":
+        built = _build_joint_features(sample, timestamps, dt, cfg)
+    elif resolved_modality == "joint_command":
+        built = _build_joint_command_features(sample, timestamps, dt, cfg)
+    elif resolved_modality == "cartesian":
+        built = _build_cartesian_features(sample, timestamps, dt, cfg)
+    else:  # pragma: no cover
+        raise ValueError(f"unsupported modality: {resolved_modality}")
 
     return {
-        "feature_matrix": feature_matrix,
+        "modality": resolved_modality,
+        "matrix": built["matrix"],
+        "feature_matrix": built["matrix"],
+        "feature_names": built["feature_names"],
+        "timestamps": built["timestamps"],
+        "source_channels": built["source_channels"],
+        "aux_signals": built["aux_signals"],
+    }
+
+
+# -----------------------------
+# modality builders
+# -----------------------------
+def _build_joint_features(
+    sample: Mapping[str, Any],
+    timestamps: Array,
+    dt: float,
+    cfg: FeatureBuildConfig,
+) -> Dict[str, Any]:
+    q = _to_2d(np.asarray(_pick(sample, "q", "joint_pos"), dtype=float))
+    t_rs, filtered = _resample_and_smooth({"q": q}, timestamps, dt, cfg)
+
+    q_f = filtered["q"]
+    dq = _gradient(q_f, dt)
+    ddq = _gradient(dq, dt)
+
+    blocks = {"joint": np.concatenate([q_f, dq, ddq], axis=1)}
+    block_feature_names = {
+        "joint": (
+            _channel_names("q", q_f.shape[1])
+            + _channel_names("dq", dq.shape[1])
+            + _channel_names("ddq", ddq.shape[1])
+        )
+    }
+
+    matrix, feature_names = _finalize_blocks(blocks, block_feature_names, cfg, ["joint"])
+    return {
+        "matrix": matrix,
+        "feature_names": feature_names,
         "timestamps": t_rs,
-        "aux_signals": aux,
+        "source_channels": {"joint": ["q"]},
+        "aux_signals": {
+            "original": {"timestamps": timestamps, "q": q},
+            "resampled": {"timestamps": t_rs, "q": q_f, "dq": dq, "ddq": ddq},
+        },
+    }
+
+
+def _build_joint_command_features(
+    sample: Mapping[str, Any],
+    timestamps: Array,
+    dt: float,
+    cfg: FeatureBuildConfig,
+) -> Dict[str, Any]:
+    q = _to_2d(np.asarray(_pick(sample, "q", "joint_pos"), dtype=float))
+    q_cmd = _to_2d(np.asarray(_pick(sample, "q_cmd", "joint_cmd"), dtype=float))
+    if q.shape != q_cmd.shape:
+        raise ValueError(f"q and q_cmd shape mismatch: {q.shape} != {q_cmd.shape}")
+
+    t_rs, filtered = _resample_and_smooth({"q": q, "q_cmd": q_cmd}, timestamps, dt, cfg)
+    q_f = filtered["q"]
+    q_cmd_f = filtered["q_cmd"]
+    dq = _gradient(q_f, dt)
+    ddq = _gradient(dq, dt)
+    q_err = q_cmd_f - q_f
+
+    blocks = {
+        "joint": np.concatenate([q_f, dq, ddq], axis=1),
+        "command": np.concatenate([q_cmd_f, q_err], axis=1),
+    }
+    block_feature_names = {
+        "joint": (
+            _channel_names("q", q_f.shape[1])
+            + _channel_names("dq", dq.shape[1])
+            + _channel_names("ddq", ddq.shape[1])
+        ),
+        "command": (
+            _channel_names("q_cmd", q_cmd_f.shape[1])
+            + _channel_names("q_err", q_err.shape[1])
+        ),
+    }
+
+    matrix, feature_names = _finalize_blocks(
+        blocks,
+        block_feature_names,
+        cfg,
+        ["joint", "command"],
+    )
+    return {
+        "matrix": matrix,
+        "feature_names": feature_names,
+        "timestamps": t_rs,
+        "source_channels": {"joint": ["q"], "command": ["q_cmd", "q_err"]},
+        "aux_signals": {
+            "original": {"timestamps": timestamps, "q": q, "q_cmd": q_cmd},
+            "resampled": {
+                "timestamps": t_rs,
+                "q": q_f,
+                "q_cmd": q_cmd_f,
+                "dq": dq,
+                "ddq": ddq,
+                "q_err": q_err,
+            },
+        },
+    }
+
+
+def _build_cartesian_features(
+    sample: Mapping[str, Any],
+    timestamps: Array,
+    dt: float,
+    cfg: FeatureBuildConfig,
+) -> Dict[str, Any]:
+    pos = _extract_position(sample)
+    quat = _extract_quaternion(sample, required=False)
+
+    signals: Dict[str, Array] = {"position": pos}
+    source_channels = ["position"]
+    original: Dict[str, Array] = {"timestamps": timestamps, "position": pos}
+
+    if quat is not None:
+        rotvec = unwrap_orientation(quat_to_rotvec(quat))
+        signals["rotvec"] = rotvec
+        source_channels.append("quaternion")
+        original["quaternion"] = quat
+
+    t_rs, filtered = _resample_and_smooth(signals, timestamps, dt, cfg)
+    pos_f = filtered["position"]
+    dpos = _gradient(pos_f, dt)
+    ddpos = _gradient(dpos, dt)
+
+    cartesian_parts = [pos_f, dpos, ddpos]
+    cartesian_feature_names = (
+        _channel_names("pos", pos_f.shape[1])
+        + _channel_names("dpos", dpos.shape[1])
+        + _channel_names("ddpos", ddpos.shape[1])
+    )
+    resampled: Dict[str, Array] = {
+        "timestamps": t_rs,
+        "position": pos_f,
+        "dpos": dpos,
+        "ddpos": ddpos,
+    }
+
+    if "rotvec" in filtered:
+        rot_f = filtered["rotvec"]
+        drot = _gradient(rot_f, dt)
+        ddrot = _gradient(drot, dt)
+        cartesian_parts.extend([rot_f, drot, ddrot])
+        cartesian_feature_names += (
+            _channel_names("rotvec", rot_f.shape[1])
+            + _channel_names("drot", drot.shape[1])
+            + _channel_names("ddrot", ddrot.shape[1])
+        )
+        resampled["rotvec"] = rot_f
+        resampled["drot"] = drot
+        resampled["ddrot"] = ddrot
+
+    blocks = {"cartesian": np.concatenate(cartesian_parts, axis=1)}
+    block_feature_names = {"cartesian": cartesian_feature_names}
+
+    matrix, feature_names = _finalize_blocks(blocks, block_feature_names, cfg, ["cartesian"])
+    return {
+        "matrix": matrix,
+        "feature_names": feature_names,
+        "timestamps": t_rs,
+        "source_channels": {"cartesian": source_channels},
+        "aux_signals": {"original": original, "resampled": resampled},
     }
 
 
@@ -204,9 +354,9 @@ def build_features(sample: Mapping[str, Any], config: Optional[FeatureBuildConfi
 # helpers
 # -----------------------------
 def _pick(sample: Mapping[str, Any], *keys: str) -> Any:
-    for k in keys:
-        if k in sample:
-            return sample[k]
+    for key in keys:
+        if key in sample:
+            return sample[key]
     raise KeyError(f"missing keys; expected one of: {keys}")
 
 
@@ -214,34 +364,88 @@ def _to_2d(x: Array) -> Array:
     return x[:, None] if x.ndim == 1 else x
 
 
+def _infer_modality(sample: Mapping[str, Any]) -> str:
+    if any(key in sample for key in ("position", "cartesian", "quaternion")) and not any(
+        key in sample for key in ("q", "joint_pos")
+    ):
+        return "cartesian"
+    if "q_cmd" in sample or "joint_cmd" in sample:
+        return "joint_command"
+    return "joint"
+
+
+def _resolve_dt(timestamps: Array, dt_override: float | None) -> float:
+    if dt_override is not None:
+        if dt_override <= 0:
+            raise ValueError("dt must be > 0")
+        return float(dt_override)
+
+    if timestamps.ndim != 1 or len(timestamps) < 2:
+        raise ValueError("timestamps must be a 1D array with at least 2 elements")
+    diffs = np.diff(timestamps)
+    diffs = diffs[diffs > 0]
+    if len(diffs) == 0:
+        raise ValueError("timestamps must contain at least one positive interval")
+    return float(np.median(diffs))
+
+
+def _resample_and_smooth(
+    signals: Mapping[str, Array],
+    timestamps: Array,
+    dt: float,
+    cfg: FeatureBuildConfig,
+) -> tuple[Array, Dict[str, Array]]:
+    t_rs, resampled = resample_fixed_dt(timestamps, signals, dt)
+    filtered: Dict[str, Array] = {}
+    for name, value in resampled.items():
+        filtered[name] = _to_2d(
+            np.asarray(
+                smooth_signal(
+                    value,
+                    dt,
+                    cfg.smoothing,
+                    cfg.savgol_window,
+                    cfg.savgol_polyorder,
+                    cfg.lowpass_cutoff_hz,
+                    cfg.lowpass_order,
+                ),
+                dtype=float,
+            )
+        )
+    return t_rs, filtered
+
+
+def _gradient(x: Array, dt: float) -> Array:
+    return _to_2d(np.gradient(np.asarray(x, dtype=float), dt, axis=0))
+
+
+def _channel_names(prefix: str, count: int) -> list[str]:
+    return [f"{prefix}_{idx}" for idx in range(count)]
+
+
 def _extract_position(sample: Mapping[str, Any]) -> Array:
     if "position" in sample:
         return _to_2d(np.asarray(sample["position"], dtype=float))
     if "cartesian" in sample:
-        c = np.asarray(sample["cartesian"], dtype=float)
-        if c.shape[1] >= 3:
-            return c[:, :3]
+        cartesian = np.asarray(sample["cartesian"], dtype=float)
+        if cartesian.ndim == 2 and cartesian.shape[1] >= 3:
+            return cartesian[:, :3]
     if "x" in sample and "y" in sample and "z" in sample:
         return np.column_stack([sample["x"], sample["y"], sample["z"]]).astype(float)
     raise KeyError("position signal not found")
 
 
-def _extract_quaternion(sample: Mapping[str, Any]) -> Array:
+def _extract_quaternion(sample: Mapping[str, Any], required: bool = True) -> Array | None:
     if "quaternion" in sample:
-        q = np.asarray(sample["quaternion"], dtype=float)
-        return _to_2d(q)
+        quaternion = np.asarray(sample["quaternion"], dtype=float)
+        return _to_2d(quaternion)
     if "cartesian" in sample:
-        c = np.asarray(sample["cartesian"], dtype=float)
-        if c.shape[1] >= 7:
-            return c[:, 3:7]
-    raise KeyError("quaternion signal not found")
-
-
-def _extract_gripper(sample: Mapping[str, Any]) -> Array:
-    for k in ("gripper", "gripper_opening", "grip", "gripper_ratio"):
-        if k in sample:
-            return _to_2d(np.asarray(sample[k], dtype=float))
-    return np.zeros((len(np.asarray(_pick(sample, "timestamps", "t", "time"))), 1), dtype=float)
+        cartesian = np.asarray(sample["cartesian"], dtype=float)
+        if cartesian.ndim == 2 and cartesian.shape[1] >= 7:
+            return cartesian[:, 3:7]
+    if required:
+        raise KeyError("quaternion signal not found")
+    return None
 
 
 def quat_to_rotvec(quat_xyzw: Array) -> Array:
@@ -264,13 +468,20 @@ def _moving_average(x: Array, k: int = 5) -> Array:
     k = max(3, int(k))
     if k % 2 == 0:
         k += 1
-    if x.ndim == 1:
-        x = x[:, None]
+
+    input_was_1d = np.asarray(x).ndim == 1
+    x_arr = np.asarray(x, dtype=float)
+    if input_was_1d:
+        x_arr = x_arr[:, None]
+
     pad = k // 2
-    xp = np.pad(x, ((pad, pad), (0, 0)), mode="edge")
+    xp = np.pad(x_arr, ((pad, pad), (0, 0)), mode="edge")
     kernel = np.ones(k) / k
-    y = np.stack([np.convolve(xp[:, i], kernel, mode="valid") for i in range(x.shape[1])], axis=1)
-    return y if y.shape[1] > 1 else y[:, 0]
+    y = np.stack(
+        [np.convolve(xp[:, i], kernel, mode="valid") for i in range(x_arr.shape[1])],
+        axis=1,
+    )
+    return y[:, 0] if input_was_1d else y
 
 
 def _robust_scale(x: Array, mode: str) -> Array:
@@ -295,11 +506,25 @@ def _normalize_and_weight(
     mode: str,
     modality_weights: Optional[Mapping[str, float]],
 ) -> Dict[str, Array]:
-    weights = {"joint": 1.0, "cartesian": 1.0, "gripper": 1.0}
+    weights = {"joint": 1.0, "cartesian": 1.0, "command": 1.0}
     if modality_weights:
         weights.update({k: float(v) for k, v in modality_weights.items()})
 
     out: Dict[str, Array] = {}
     for name, x in modalities.items():
-        out[name] = _robust_scale(x, mode) * weights.get(name, 1.0)
+        out[name] = _robust_scale(np.asarray(x, dtype=float), mode) * weights.get(name, 1.0)
     return out
+
+
+def _finalize_blocks(
+    blocks: Mapping[str, Array],
+    block_feature_names: Mapping[str, list[str]],
+    cfg: FeatureBuildConfig,
+    order: list[str],
+) -> tuple[Array, list[str]]:
+    normalized = _normalize_and_weight(blocks, cfg.normalize, cfg.modality_weights)
+    matrices = [normalized[name] for name in order if name in normalized]
+    feature_names: list[str] = []
+    for name in order:
+        feature_names.extend(block_feature_names.get(name, []))
+    return np.concatenate(matrices, axis=1), feature_names

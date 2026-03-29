@@ -21,6 +21,18 @@ full = [
     "pyyaml",
     "huggingface_hub",
 ]
+experiment = [
+    "scipy",
+    "ruptures",
+    "pandas",
+    "pyarrow",
+    "pyyaml",
+    "huggingface_hub",
+    "fast-ticc",
+    "sktime",
+    "scikit-learn",
+    "pytest",
+]
 # pinocchio (required for FK) must be installed via conda, not pip:
 #   conda install -c conda-forge pinocchio
 
