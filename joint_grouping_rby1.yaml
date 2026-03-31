@@ -1,0 +1,115 @@
+# Configuration for joint grouping with RBY1 dataset
+# This configuration processes joints in groups rather than as a single block
+
+dataset:
+  n_episodes: 1
+  seed: 42
+  local: true
+  missing_values: ffill_drop
+
+features:
+  dt: null
+  smoothing: savgol
+  normalize: mad
+  modalities:
+    - joint
+  modality_weights:
+    joint: 1.0
+    cartesian: 1.0
+    command: 1.0
+  
+  # Joint grouping configuration - joints are processed in groups
+  # This reduces dimensionality and allows for more focused analysis
+  joint_groups:
+    # Torso group - 6 joints
+    torso:
+      - torso_joint_1
+      - torso_joint_2
+      - torso_joint_3
+      - torso_joint_4
+      - torso_joint_5
+      - torso_joint_6
+    
+    # Right arm group - 7 joints
+    right_arm:
+      - right_arm_joint_1
+      - right_arm_joint_2
+      - right_arm_joint_3
+      - right_arm_joint_4
+      - right_arm_joint_5
+      - right_arm_joint_6
+      - right_arm_joint_7
+    
+    # Left arm group - 7 joints
+    left_arm:
+      - left_arm_joint_1
+      - left_arm_joint_2
+      - left_arm_joint_3
+      - left_arm_joint_4
+      - left_arm_joint_5
+      - left_arm_joint_6
+      - left_arm_joint_7
+    
+    # Right hand fingers group - 12 joints
+    right_hand_fingers:
+      - right_hand_finger_joint_1
+      - right_hand_finger_joint_2
+      - right_hand_finger_joint_3
+      - right_hand_finger_joint_4
+      - right_hand_finger_joint_5
+      - right_hand_finger_joint_6
+      - right_hand_finger_joint_7
+      - right_hand_finger_joint_8
+      - right_hand_finger_joint_9
+      - right_hand_finger_joint_10
+      - right_hand_finger_joint_11
+      - right_hand_finger_joint_12
+    
+    # Left hand fingers group - 12 joints
+    left_hand_fingers:
+      - left_hand_finger_joint_1
+      - left_hand_finger_joint_2
+      - left_hand_finger_joint_3
+      - left_hand_finger_joint_4
+      - left_hand_finger_joint_5
+      - left_hand_finger_joint_6
+      - left_hand_finger_joint_7
+      - left_hand_finger_joint_8
+      - left_hand_finger_joint_9
+      - left_hand_finger_joint_10
+      - left_hand_finger_joint_11
+      - left_hand_finger_joint_12
+
+ruptures:
+  model: rbf
+  min_size: 5
+  jump: 1
+  penalty: 10.0
+  auto_method: elbow
+  penalty_range: [0.5, 200.0]
+  n_penalty_steps: 40
+  compare_algorithm: binseg
+  max_n_bkps: 30
+
+ticc:
+  enabled: false
+  window_size: 10
+  n_clusters: 3
+  max_k: 5
+  lambda_: 0.01
+  beta: 100.0
+  max_iter: 20
+  num_processors: 1
+  random_state: 42
+
+sktime:
+  enabled: false
+
+evaluation:
+  boundary_tolerance_frames: 5
+
+output:
+  plots: true
+  csv: true
+  json: true
+  report: true

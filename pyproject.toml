@@ -28,8 +28,8 @@ experiment = [
     "pyarrow",
     "pyyaml",
     "huggingface_hub",
-    "fast-ticc",
-    "sktime",
+    "fast-ticc>=1.0.1",
+    "sktime>=0.40.1",
     "scikit-learn",
     "pytest",
 ]

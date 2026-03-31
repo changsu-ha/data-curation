@@ -13,8 +13,12 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib
+import sys
 
-matplotlib.use("Agg")
+# Only use Agg backend if not showing plots interactively
+if "--show-plots" not in sys.argv:
+    matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -75,8 +79,21 @@ def _build_ticc_config(cfg: dict[str, Any]) -> TiccConfig:
         lambda_=float(section.get("lambda_", 0.11)),
         beta=float(section.get("beta", 400.0)),
         max_iter=int(section.get("max_iter", 100)),
+        num_processors=int(section.get("num_processors", 1)),
         random_state=int(section.get("random_state", 42)),
     )
+
+
+def _is_ticc_enabled(cfg: dict[str, Any]) -> bool:
+    """Check if TICC processing is enabled in the configuration."""
+    section = cfg.get("ticc", {})
+    return bool(section.get("enabled", True))
+
+
+def _is_sktime_enabled(cfg: dict[str, Any]) -> bool:
+    """Check if sktime processing is enabled in the configuration."""
+    section = cfg.get("sktime", {})
+    return bool(section.get("enabled", True))
 
 
 def _build_feature_config(cfg: dict[str, Any], dt_override: float | None) -> FeatureBuildConfig:
@@ -88,6 +105,7 @@ def _build_feature_config(cfg: dict[str, Any], dt_override: float | None) -> Fea
         smoothing=section.get("smoothing", "savgol"),
         normalize=section.get("normalize", "mad"),
         modality_weights=section.get("modality_weights"),
+        joint_groups=section.get("joint_groups"),
     )
 
 
@@ -103,7 +121,7 @@ def _resolve_modalities(requested: list[str]) -> tuple[list[str], list[str]]:
     return canonical, alias_notes
 
 
-def _build_sample_dict(arrays: dict[str, np.ndarray], modality: str) -> dict[str, Any]:
+def _build_sample_dict(arrays: dict[str, np.ndarray], modality: str, schema: DatasetSchema | None = None) -> dict[str, Any]:
     canonical = normalize_modality_name(modality)
     sample: dict[str, Any] = {"timestamps": arrays["timestamps"]}
 
@@ -111,11 +129,17 @@ def _build_sample_dict(arrays: dict[str, np.ndarray], modality: str) -> dict[str
         if "joint_states" not in arrays:
             raise KeyError("joint_states not available for joint-based modality")
         sample["q"] = arrays["joint_states"]
+        # Add joint names if available
+        if schema and schema.joint_state_names:
+            sample["joint_names"] = schema.joint_state_names
 
     if canonical == "joint_command":
         if "joint_commands" not in arrays:
             raise KeyError("joint_commands not available for joint_command modality")
         sample["q_cmd"] = arrays["joint_commands"]
+        # Add joint names if available
+        if schema and schema.joint_command_names:
+            sample["joint_names"] = schema.joint_command_names
 
     if canonical == "cartesian":
         if "ee_pose" not in arrays:
@@ -132,15 +156,94 @@ def _plot_segmentation(
     episode_id: Any,
     modality: str,
     save_path: Path,
+    feature_names: list[str] | None = None,
+    joint_groups: dict[str, list[str]] | None = None,
+    show_interactive: bool = False,
 ) -> None:
+    """Plot segmentation results. If joint_groups are provided, create separate plots for each group."""
+    
+    # If no joint groups or no feature names, create the original combined plot
+    if not joint_groups or not feature_names:
+        _plot_segmentation_combined(timestamps, signal_2d, boundary_results, episode_id, modality, save_path, show_interactive)
+        return
+    
+    # Create separate plots for each joint group
+    group_indices = _get_group_indices(feature_names, joint_groups)
+    
+    # Create combined plot
+    _plot_segmentation_combined(timestamps, signal_2d, boundary_results, episode_id, modality, save_path, show_interactive)
+    
+    # Create separate plots for each group
+    for group_name, indices in group_indices.items():
+        if indices:
+            group_save_path = save_path.parent / f"{save_path.stem}_{group_name}{save_path.suffix}"
+            # Extract feature names for this group
+            group_feature_names = [feature_names[i] for i in indices] if feature_names else None
+            _plot_segmentation_group(
+                timestamps, 
+                signal_2d[:, indices], 
+                boundary_results, 
+                episode_id, 
+                modality, 
+                group_save_path, 
+                group_name,
+                show_interactive,
+                group_feature_names
+            )
+
+
+def _get_group_indices(feature_names: list[str], joint_groups: dict[str, list[str]]) -> dict[str, list[int]]:
+    """Map joint group names to their corresponding feature indices."""
+    group_indices = {group_name: [] for group_name in joint_groups.keys()}
+    
+    for idx, feature_name in enumerate(feature_names):
+        # Feature names are like "q_torso_0", "dq_right_arm_1", etc.
+        for group_name in joint_groups.keys():
+            # Check if the feature belongs to this group
+            # Look for patterns like "_{group_name}_" or ending with "_{group_name}"
+            if f"_{group_name}_" in feature_name or feature_name.endswith(f"_{group_name}"):
+                group_indices[group_name].append(idx)
+                break
+            # Also check for features that might have the group name as part of the feature (e.g., "q_left_arm_0")
+            elif f"_{group_name}_" in f"_{feature_name}" or f"_{feature_name}".endswith(f"_{group_name}"):
+                group_indices[group_name].append(idx)
+                break
+    
+    return group_indices
+
+
+def _plot_segmentation_combined(
+    timestamps: np.ndarray,
+    signal_2d: np.ndarray,
+    boundary_results: dict[str, list[int]],
+    episode_id: Any,
+    modality: str,
+    save_path: Path,
+    show_interactive: bool = False,
+) -> None:
+    """Create the original combined segmentation plot."""
     n_dims = min(3, signal_2d.shape[1])
     n_methods = len(boundary_results)
     fig, axes = plt.subplots(n_dims + 1, 1, figsize=(14, 3 * (n_dims + 1)), sharex=True)
     colors = plt.cm.tab10(np.linspace(0, 1, max(n_methods, 1)))
 
+    # Handle case where there's only one subplot (axes is not an array)
+    if n_dims + 1 == 1:
+        axes = [axes]
+    else:
+        axes = list(axes)
+
     for idx in range(n_dims):
         ax = axes[idx]
         ax.plot(timestamps, signal_2d[:, idx], color="black", linewidth=0.8, alpha=0.85)
+        
+        # Set autonomous y-axis limits based on actual data range with margin
+        y_data = signal_2d[:, idx]
+        y_min, y_max = np.min(y_data), np.max(y_data)
+        y_range = y_max - y_min
+        y_margin = y_range * 0.1 if y_range > 0 else 0.1
+        ax.set_ylim(y_min - y_margin, y_max + y_margin)
+        
         for color_idx, (method, bounds) in enumerate(boundary_results.items()):
             for boundary in bounds:
                 if 0 < boundary < len(timestamps):
@@ -161,12 +264,133 @@ def _plot_segmentation(
     ax_bar.set_ylabel("# segments", fontsize=9)
     ax_bar.set_xlabel("Method", fontsize=9)
 
-    fig.suptitle(f"Episode {episode_id} - {modality} segmentation", fontsize=12)
+    fig.suptitle(f"Episode {episode_id} - {modality} segmentation (Combined)", fontsize=12)
     plt.tight_layout()
     save_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(save_path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  [plot] {save_path}")
+    
+    if show_interactive:
+        # Show the plot interactively and save when closed
+        def on_close(event):
+            if event.canvas.figure == fig:
+                fig.savefig(save_path, dpi=120, bbox_inches="tight")
+                print(f"  [plot saved] {save_path}")
+        
+        fig.canvas.mpl_connect('close_event', on_close)
+        plt.show()
+    else:
+        plt.close(fig)
+    
+    if not show_interactive:
+        print(f"  [plot] {save_path}")
+
+
+def _plot_segmentation_group(
+    timestamps: np.ndarray,
+    signal_2d: np.ndarray,
+    boundary_results: dict[str, list[int]],
+    episode_id: Any,
+    modality: str,
+    save_path: Path,
+    group_name: str,
+    show_interactive: bool = False,
+    feature_names: list[str] | None = None,
+) -> None:
+    """Create segmentation plot for a specific joint group."""
+    # For joint groups, show all dimensions but organize in 2 columns for better visualization
+    n_dims = signal_2d.shape[1]  # Show all dimensions
+    
+    # For hand groups, we want to show all joints, so we don't limit the dimensions
+    # For other groups, we might still want to limit to a reasonable number
+    if "hand" in group_name.lower():
+        # Show all dimensions for hand groups
+        n_dims = min(n_dims, signal_2d.shape[1])
+    else:
+        # For other groups, limit to 18 dimensions for readability
+        n_dims = min(18, signal_2d.shape[1])
+    
+    n_methods = len(boundary_results)
+    
+    # Create 2-column layout
+    n_cols = 2
+    n_rows = (n_dims + 1) // n_cols + 1  # +1 for the bar chart row
+    
+    # Calculate figure size based on number of subplots
+    fig_width = 14
+    fig_height = 3 * ((n_dims + 1) // n_cols + 1)
+    fig = plt.figure(figsize=(fig_width, fig_height))
+    
+    # Create a grid for subplots
+    from matplotlib.gridspec import GridSpec
+    gs = GridSpec((n_dims + 1) // n_cols + 1, n_cols, figure=fig, hspace=0.3)
+    
+    colors = plt.cm.tab10(np.linspace(0, 1, max(n_methods, 1)))
+    
+    # Plot each dimension with autonomous y-axis scaling
+    axes = []
+    for idx in range(n_dims):
+        row = idx // n_cols
+        col = idx % n_cols
+        ax = fig.add_subplot(gs[row, col])
+        axes.append(ax)
+        
+        ax.plot(timestamps, signal_2d[:, idx], color="black", linewidth=0.8, alpha=0.85)
+        
+        # Set autonomous y-axis limits based on actual data range with margin
+        y_data = signal_2d[:, idx]
+        y_min, y_max = np.min(y_data), np.max(y_data)
+        y_range = y_max - y_min
+        y_margin = y_range * 0.1 if y_range > 0 else 0.1
+        ax.set_ylim(y_min - y_margin, y_max + y_margin)
+        
+        for color_idx, (method, bounds) in enumerate(boundary_results.items()):
+            for boundary in bounds:
+                if 0 < boundary < len(timestamps):
+                    ax.axvline(
+                        timestamps[boundary],
+                        color=colors[color_idx],
+                        alpha=0.6,
+                        linewidth=1.2,
+                        label=method if idx == 0 else None,
+                    )
+        
+        # Set y-axis label with proper mathematical notation
+        if feature_names and idx < len(feature_names):
+            feature_name = feature_names[idx]
+            # Parse feature name to get joint name and type
+            y_label = _format_feature_label(feature_name)
+            ax.set_ylabel(y_label, fontsize=9)
+        else:
+            ax.set_ylabel(f"dim {idx}", fontsize=9)
+        
+        ax.grid(True, alpha=0.25)
+        if idx == 0 and n_methods > 0:
+            ax.legend(loc="upper right", fontsize=7, ncol=max(1, min(n_methods, 4)))
+
+    # Add bar chart for segment counts
+    ax_bar = fig.add_subplot(gs[(n_dims + 1) // n_cols, :])  # Span both columns
+    ax_bar.bar(list(boundary_results.keys()), [len(bounds) + 1 for bounds in boundary_results.values()], color=colors[:n_methods])
+    ax_bar.set_ylabel("# segments", fontsize=9)
+    ax_bar.set_xlabel("Method", fontsize=9)
+
+    fig.suptitle(f"Episode {episode_id} - {modality} segmentation ({group_name})", fontsize=12)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=120, bbox_inches="tight")
+    
+    if show_interactive:
+        # Show the plot interactively and save when closed
+        def on_close(event):
+            if event.canvas.figure == fig:
+                fig.savefig(save_path, dpi=120, bbox_inches="tight")
+                print(f"  [plot saved] {save_path}")
+        
+        fig.canvas.mpl_connect('close_event', on_close)
+        plt.show()
+    else:
+        plt.close(fig)
+    
+    if not show_interactive:
+        print(f"  [plot] {save_path}")
 
 
 def _plot_primitives(
@@ -249,6 +473,7 @@ def _process_episode(
     tolerance_frames: int,
     write_output: dict[str, bool],
     fill_policy: str,
+    show_plots: bool = False,
 ) -> dict[str, Any]:
     ep_id = ep_ref.episode_id
     print(f"\n--- Episode {ep_id} ---")
@@ -290,7 +515,7 @@ def _process_episode(
             continue
 
         try:
-            sample_dict = _build_sample_dict(arrays, modality)
+            sample_dict = _build_sample_dict(arrays, modality, schema)
             feat_out = build_features(sample_dict, modality, feat_config)
         except KeyError as exc:
             mod_results["status"] = "skipped"
@@ -362,7 +587,7 @@ def _process_episode(
         mod_results["runtimes"] = all_runtimes
         mod_results["ruptures_info"] = {"pelt": pelt_info, "binseg": binseg_info}
 
-        if len(pelt_bounds) + 1 >= 2:
+        if len(pelt_bounds) + 1 >= 2 and ticc_config is not None:
             edges = [0] + sorted(pelt_bounds) + [len(timestamps_rs)]
             segments_feats = [feat_mat[edges[i] : edges[i + 1]] for i in range(len(edges) - 1)]
             t0_ticc = time.perf_counter()
@@ -400,9 +625,10 @@ def _process_episode(
                         ep_dir / f"primitives_ticc_{modality}.png",
                     )
         else:
+            skip_reason = "Need at least 2 PELT segments for TICC" if len(pelt_bounds) + 1 < 2 else "TICC disabled by config"
             mod_results["ticc"] = {
                 "status": "skipped",
-                "reason": "Need at least 2 PELT segments for TICC",
+                "reason": skip_reason,
             }
 
         if write_output.get("plots", True):
@@ -413,6 +639,9 @@ def _process_episode(
                 ep_id,
                 modality,
                 ep_dir / f"segmentation_{modality}.png",
+                feature_names=feat_out.get("feature_names"),
+                joint_groups=feat_config.joint_groups,
+                show_interactive=show_plots,
             )
 
         ep_results["modalities"][modality] = mod_results
@@ -455,6 +684,52 @@ def _collect_skip_summary(results: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+def _format_feature_label(feature_name: str) -> str:
+    """Format feature name with proper mathematical notation.
+    
+    Examples:
+    - 'q_torso_0' -> 'θ₁' (position)
+    - 'dq_torso_0' -> 'θ̇₁' (velocity)
+    - 'ddq_torso_0' -> 'θ̈₁' (acceleration)
+    - 'q_right_arm_3' -> 'θ₄' (position)
+    """
+    # Determine feature type
+    if feature_name.startswith("ddq_"):
+        feature_type = "acceleration"
+        base_name = feature_name[3:]  # Remove "ddq" prefix
+    elif feature_name.startswith("dq_"):
+        feature_type = "velocity"
+        base_name = feature_name[2:]  # Remove "dq" prefix
+    elif feature_name.startswith("q_"):
+        feature_type = "position"
+        base_name = feature_name[1:]  # Remove "q" prefix
+    else:
+        # Unknown format, return as-is
+        return feature_name
+    
+    # Extract joint number from the end of the name
+    # Handle cases like "torso_0", "right_arm_3", etc.
+    parts = base_name.split("_")
+    if parts and parts[-1].isdigit():
+        joint_num = int(parts[-1]) + 1  # Convert to 1-based indexing
+        # Convert to subscript
+        subscript = "".join([chr(0x2080 + int(d)) if d.isdigit() else d for d in str(joint_num)])
+    else:
+        # If we can't parse the joint number, use the last part as is
+        joint_num_str = parts[-1] if parts else ""
+        subscript = joint_num_str
+    
+    # Create the mathematical notation
+    if feature_type == "position":
+        return f"q{subscript}"
+    elif feature_type == "velocity":
+        return f"dq{subscript}"
+    elif feature_type == "acceleration":
+        return f"ddq{subscript}"
+    else:
+        return feature_name
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="LeRobot segmentation and primitive discovery pipeline")
     parser.add_argument("--dataset", required=True, help="Dataset path or HF repo ID")
@@ -472,6 +747,9 @@ def main() -> None:
     parser.add_argument("--ee-frame", default="ee_right", help="End-effector frame name")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--local", action="store_true", help="Treat --dataset as a local path")
+    parser.add_argument("--skip-ticc", action="store_true", help="Skip TICC primitive discovery")
+    parser.add_argument("--skip-sktime", action="store_true", help="Skip sktime benchmarking")
+    parser.add_argument("--show-plots", action="store_true", help="Show plots interactively and save when closed")
     args = parser.parse_args()
 
     if args.config:
@@ -498,6 +776,10 @@ def main() -> None:
         "json": bool(cfg.get("output", {}).get("json", True)),
         "report": bool(cfg.get("output", {}).get("report", True)),
     }
+
+    # Check if TICC and sktime should be enabled
+    ticc_enabled = not args.skip_ticc and _is_ticc_enabled(cfg)
+    sktime_enabled = not args.skip_sktime and _is_sktime_enabled(cfg) and not args.skip_sktime
 
     output_dir = Path(args.output).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -553,14 +835,19 @@ def main() -> None:
 
     feat_config = _build_feature_config(cfg, None)
     rupt_config = _build_ruptures_config(cfg)
-    ticc_config = _build_ticc_config(cfg)
+    ticc_config = _build_ticc_config(cfg) if ticc_enabled else None
 
-    print("\nProbing sktime segmenters...")
-    sktime_available = get_available_segmenters()
-    if sktime_available:
-        print(f"  Found: {list(sktime_available.keys())}")
+    if sktime_enabled:
+        print("\nProbing sktime segmenters...")
+        sktime_available = get_available_segmenters()
+        if sktime_available:
+            print(f"  Found: {list(sktime_available.keys())}")
+        else:
+            print("  No sktime segmenters found.")
+            sktime_available = {}
     else:
-        print("  No sktime segmenters found.")
+        print("\nSkipping sktime benchmarking (disabled by config or --skip-sktime)")
+        sktime_available = {}
 
     print("\nPhase 3: Processing episodes")
     all_results: list[dict[str, Any]] = []
@@ -574,12 +861,13 @@ def main() -> None:
             feat_config=feat_config,
             rupt_config=rupt_config,
             ticc_config=ticc_config,
-            sktime_available=sktime_available,
+            sktime_available=sktime_available if sktime_enabled else {},
             output_dir=output_dir,
             fk_assets=fk_assets,
             tolerance_frames=tolerance_frames,
             write_output=write_output,
             fill_policy=fill_policy,
+            show_plots=args.show_plots,
         )
         all_results.append(result)
         for modality in modalities:
@@ -605,6 +893,8 @@ def main() -> None:
         f"- Layout: `{schema.layout}`",
         f"- Episodes processed: {len(sampled)}",
         f"- Modalities: {', '.join(modalities)}",
+        f"- TICC enabled: {ticc_enabled}",
+        f"- sktime enabled: {sktime_enabled}",
         "",
     ]
     if alias_notes:
@@ -645,7 +935,7 @@ def main() -> None:
             "",
             "- No ground-truth labels were used; comparison is unsupervised via inter-method agreement.",
             "- PELT penalty is chosen automatically unless a fixed value is configured.",
-            "- TICC and sktime results are skipped when the corresponding libraries are unavailable.",
+            "- TICC and sktime results are skipped when the corresponding libraries are unavailable or disabled.",
             "- Cartesian modality is skipped when neither ee_pose nor a valid FK path is available.",
             "",
             "## Next Steps",

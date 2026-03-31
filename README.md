@@ -2,12 +2,12 @@
 
 로봇 trajectory segmentation과 Cartesian 좌표 변환 기능을 제공하는 Python 유틸리티 패키지입니다.
 
-크게 네 가지 축의 기능이 들어 있습니다.
+주요 기능:
 
-1. `segmentation-cli`로 바로 실행할 수 있는 간단한 텍스트 기반 분할 파이프라인
+1. **데이터 기반 실험 파이프라인**: 실제 데이터셋 스키마 자동 탐지 → ruptures CPD → fast_ticc 반복 primitive 발굴 → sktime 벤치마크 → 비교 리포트 생성
 2. 로봇 trajectory 데이터를 입력받아 경계 검출, 구간 라벨링, feature 구성, 리포트 생성을 수행하는 Python API
 3. RB-Y1 URDF + Pinocchio를 이용한 joint space → Cartesian pose FK 변환 및 episode 세그멘테이션 스크립트
-4. **데이터 기반 실험 파이프라인**: 실제 데이터셋 스키마 자동 탐지 → ruptures CPD → fast_ticc 반복 primitive 발굴 → sktime 벤치마크 → 비교 리포트 생성
+4. `segmentation-cli`로 바로 실행할 수 있는 간단한 텍스트 기반 분할 파이프라인
 
 ## 주요 기능
 
@@ -89,6 +89,11 @@ data-curation/
 - Python 3.10 이상
 - FK 기능(`kinematics.py`)은 **pinocchio**가 필요합니다. pinocchio는 pip으로 설치할 수 없으며 conda-forge를 통해서만 설치됩니다.
 - 실험 파이프라인 추가 패키지 (선택): `fast-ticc`, `sktime`, `scikit-learn`
+
+## 업데이트된 종속성 정보
+
+- `sktime` 0.40.1 이상 버전과의 호환성 향상 (detection 모듈 지원)
+- `fast-ticc` 1.0.1 이상 버전과의 호환성 향상 (ticc_labels 함수 사용)
 
 ## 설치 방법
 
@@ -621,3 +626,130 @@ pip install scipy ruptures pandas pyarrow
 pip install fast-ticc sktime scikit-learn
 ```
 또는 `pip install -e ".[experiment]"`
+
+### Version Compatibility Issues
+
+#### `fast_ticc` 버전 호환성 문제
+
+fast_ticc 라이브러리의 버전에 따라 API가 다를 수 있습니다. 
+현재 코드는 fast-ticc 1.0.1 버전과 호환되도록 업데이트되었습니다.
+이전 버전에서는 `ticc` 함수 대신 `ticc_labels` 함수를 사용하도록 수정되었습니다.
+
+#### `sktime` 버전 호환성 문제
+
+sktime 라이브러리의 버전에 따라 모듈 구조가 다를 수 있습니다.
+현재 코드는 sktime 0.40.1 버전과 호환되도록 업데이트되었습니다.
+`sktime.annotation` 모듈 대신 `sktime.detection` 모듈에서 세그멘테이션 알고리즘을 찾도록 수정되었습니다.
+
+만약 버전 호환성 문제가 발생하면, 다음 명령어로 최신 버전을 설치하세요:
+
+```bash
+pip install --upgrade fast-ticc sktime
+```
+
+## Joint Grouping (New Feature)
+
+The pipeline now supports processing joints in groups rather than as a single block. This can significantly reduce computational complexity and allow for more focused analysis of specific robot parts.
+
+### Configuration
+
+To enable joint grouping, add a `joint_groups` section to your configuration:
+
+```yaml
+features:
+  joint_groups:
+    # Process torso joints as a group
+    torso:
+      - torso_joint_1
+      - torso_joint_2
+      - torso_joint_3
+      - torso_joint_4
+      - torso_joint_5
+      - torso_joint_6
+    
+    # Process right arm joints as a group
+    right_arm:
+      - right_arm_joint_1
+      - right_arm_joint_2
+      - right_arm_joint_3
+      - right_arm_joint_4
+      - right_arm_joint_5
+      - right_arm_joint_6
+      - right_arm_joint_7
+    
+    # Process left arm joints as a group
+    left_arm:
+      - left_arm_joint_1
+      - left_arm_joint_2
+      - left_arm_joint_3
+      - left_arm_joint_4
+      - left_arm_joint_5
+      - left_arm_joint_6
+      - left_arm_joint_7
+    
+    # Process right hand finger joints as a group
+    right_hand_fingers:
+      - right_hand_finger_joint_1
+      - right_hand_finger_joint_2
+      - right_hand_finger_joint_3
+      - right_hand_finger_joint_4
+      - right_hand_finger_joint_5
+      - right_hand_finger_joint_6
+      - right_hand_finger_joint_7
+      - right_hand_finger_joint_8
+      - right_hand_finger_joint_9
+      - right_hand_finger_joint_10
+      - right_hand_finger_joint_11
+      - right_hand_finger_joint_12
+    
+    # Process left hand finger joints as a group
+    left_hand_fingers:
+      - left_hand_finger_joint_1
+      - left_hand_finger_joint_2
+      - left_hand_finger_joint_3
+      - left_hand_finger_joint_4
+      - left_hand_finger_joint_5
+      - left_hand_finger_joint_6
+      - left_hand_finger_joint_7
+      - left_hand_finger_joint_8
+      - left_hand_finger_joint_9
+      - left_hand_finger_joint_10
+      - left_hand_finger_joint_11
+      - left_hand_finger_joint_12
+```
+
+### Benefits
+
+When joint groups are specified:
+* Each group is processed independently with its own position/velocity/acceleration features
+* Dimensionality is reduced (instead of 44D joint space, you get separate groups)
+* TICC and other algorithms run faster on lower-dimensional data
+* Results are more interpretable as they relate to specific robot components
+* Separate visualization plots are generated for each joint group
+
+### Modular Workflow
+
+The pipeline now supports a modular workflow where users can run rupture analysis first and then optionally run TICC and sktime analysis:
+
+```bash
+# Run rupture analysis only (no TICC/sktime)
+python scripts/run_lerobot_segmentation.py --dataset /path/to/dataset --local --n-episodes 1 --modalities joint --output results --skip-ticc --skip-sktime
+
+# Run full pipeline (rupture + TICC + sktime)
+python scripts/run_lerobot_segmentation.py --dataset /path/to/dataset --local --n-episodes 1 --modalities joint --output results
+
+# Run with interactive plotting (plots will be saved when closed)
+python scripts/run_lerobot_segmentation.py --dataset /path/to/dataset --local --n-episodes 1 --modalities joint --output results --show-plots
+```
+
+### Enhanced Visualization
+
+The pipeline now generates separate plots for each joint group:
+* `segmentation_joint.png` - Combined overview plot
+* `segmentation_joint_torso.png` - Torso group plot
+* `segmentation_joint_right_arm.png` - Right arm group plot
+* `segmentation_joint_left_arm.png` - Left arm group plot
+* `segmentation_joint_right_hand_fingers.png` - Right hand fingers group plot
+* `segmentation_joint_left_hand_fingers.png` - Left hand fingers group plot
+
+Each plot shows up to 18 dimensions for better visualization of all features in each group.

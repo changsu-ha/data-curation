@@ -196,8 +196,19 @@ def _feature_entry_names(info: dict[str, Any], key: str | None, dim: int, prefix
     entry = features.get(key) if isinstance(features, dict) else None
     if isinstance(entry, dict):
         names = entry.get("names")
-        if isinstance(names, list) and len(names) == dim:
-            return [str(name) for name in names], "info_json"
+        # Handle nested list structure (e.g., names: [["joint1", "joint2", ...]])
+        if isinstance(names, list):
+            if len(names) > 0 and isinstance(names[0], list):
+                # Flatten the nested list
+                flattened_names = []
+                for sublist in names:
+                    if isinstance(sublist, list):
+                        flattened_names.extend(sublist)
+                    else:
+                        flattened_names.append(sublist)
+                names = flattened_names
+            if len(names) == dim:
+                return [str(name) for name in names], "info_json"
     return _default_names(prefix, dim), "generated"
 
 

@@ -34,6 +34,7 @@ class FeatureBuildConfig:
     lowpass_order: int = 3
     normalize: str = "mad"  # mad | iqr | none
     modality_weights: Optional[Mapping[str, float]] = None
+    joint_groups: Optional[Mapping[str, list[str]]] = None  # Group name -> list of joint names
 
 
 def normalize_modality_name(modality: str) -> str:
@@ -199,6 +200,11 @@ def _build_joint_features(
     cfg: FeatureBuildConfig,
 ) -> Dict[str, Any]:
     q = _to_2d(np.asarray(_pick(sample, "q", "joint_pos"), dtype=float))
+    
+    # Handle joint grouping if specified
+    if cfg.joint_groups and len(cfg.joint_groups) > 0:
+        return _build_grouped_joint_features(sample, timestamps, dt, cfg, q)
+    
     t_rs, filtered = _resample_and_smooth({"q": q}, timestamps, dt, cfg)
 
     q_f = filtered["q"]
@@ -227,6 +233,80 @@ def _build_joint_features(
     }
 
 
+def _build_grouped_joint_features(
+    sample: Mapping[str, Any],
+    timestamps: Array,
+    dt: float,
+    cfg: FeatureBuildConfig,
+    q: Array,
+) -> Dict[str, Any]:
+    """Build joint features grouped by joint names."""
+    # For grouped processing, we need to know the joint names
+    # This would typically come from the dataset schema or configuration
+    joint_names = sample.get("joint_names", [f"joint_{i}" for i in range(q.shape[1])])
+    
+    # Create mapping from joint name to index
+    name_to_idx = {name: i for i, name in enumerate(joint_names)}
+    
+    # Build features for each group
+    group_blocks = {}
+    group_feature_names = {}
+    
+    # Initialize t_rs with the original timestamps (will be updated if we process groups)
+    t_rs = timestamps
+    
+    for group_name, group_joint_names in cfg.joint_groups.items():
+        # Get indices for this group
+        indices = [name_to_idx[name] for name in group_joint_names if name in name_to_idx]
+        if not indices:
+            continue
+            
+        # Extract group data
+        q_group = q[:, indices]
+        
+        # Process group data
+        t_rs, filtered = _resample_and_smooth({f"q_{group_name}": q_group}, timestamps, dt, cfg)
+        q_f = filtered[f"q_{group_name}"]
+        dq = _gradient(q_f, dt)
+        ddq = _gradient(dq, dt)
+        
+        # Store group features
+        group_blocks[group_name] = np.concatenate([q_f, dq, ddq], axis=1)
+        group_feature_names[group_name] = (
+            _channel_names(f"q_{group_name}", q_f.shape[1])
+            + _channel_names(f"dq_{group_name}", dq.shape[1])
+            + _channel_names(f"ddq_{group_name}", ddq.shape[1])
+        )
+    
+    # Handle case when no groups were processed
+    if not group_blocks:
+        # Return empty feature matrix
+        return {
+            "matrix": np.empty((len(timestamps), 0)),
+            "feature_names": [],
+            "timestamps": timestamps,
+            "source_channels": {"joint_groups": []},
+            "aux_signals": {
+                "original": {"timestamps": timestamps, "q": q},
+                "resampled": {"timestamps": timestamps, "q_groups": {}},
+            },
+        }
+    
+    # Combine all groups
+    matrix, feature_names = _finalize_blocks(group_blocks, group_feature_names, cfg, list(group_blocks.keys()))
+    
+    return {
+        "matrix": matrix,
+        "feature_names": feature_names,
+        "timestamps": t_rs,
+        "source_channels": {"joint_groups": list(cfg.joint_groups.keys())},
+        "aux_signals": {
+            "original": {"timestamps": timestamps, "q": q},
+            "resampled": {"timestamps": t_rs, "q_groups": group_blocks},
+        },
+    }
+
+
 def _build_joint_command_features(
     sample: Mapping[str, Any],
     timestamps: Array,
@@ -238,6 +318,10 @@ def _build_joint_command_features(
     if q.shape != q_cmd.shape:
         raise ValueError(f"q and q_cmd shape mismatch: {q.shape} != {q_cmd.shape}")
 
+    # Handle joint grouping if specified
+    if cfg.joint_groups and len(cfg.joint_groups) > 0:
+        return _build_grouped_joint_command_features(sample, timestamps, dt, cfg, q, q_cmd)
+    
     t_rs, filtered = _resample_and_smooth({"q": q, "q_cmd": q_cmd}, timestamps, dt, cfg)
     q_f = filtered["q"]
     q_cmd_f = filtered["q_cmd"]
@@ -282,6 +366,99 @@ def _build_joint_command_features(
                 "ddq": ddq,
                 "q_err": q_err,
             },
+        },
+    }
+
+
+def _build_grouped_joint_command_features(
+    sample: Mapping[str, Any],
+    timestamps: Array,
+    dt: float,
+    cfg: FeatureBuildConfig,
+    q: Array,
+    q_cmd: Array,
+) -> Dict[str, Any]:
+    """Build joint command features grouped by joint names."""
+    # For grouped processing, we need to know the joint names
+    # This would typically come from the dataset schema or configuration
+    joint_names = sample.get("joint_names", [f"joint_{i}" for i in range(q.shape[1])])
+    
+    # Create mapping from joint name to index
+    name_to_idx = {name: i for i, name in enumerate(joint_names)}
+    
+    # Build features for each group
+    group_blocks = {}
+    group_feature_names = {}
+    
+    # Initialize t_rs with the original timestamps (will be updated if we process groups)
+    t_rs = timestamps
+    
+    for group_name, group_joint_names in cfg.joint_groups.items():
+        # Get indices for this group
+        indices = [name_to_idx[name] for name in group_joint_names if name in name_to_idx]
+        if not indices:
+            continue
+            
+        # Extract group data
+        q_group = q[:, indices]
+        q_cmd_group = q_cmd[:, indices]
+        
+        # Process group data
+        t_rs, filtered = _resample_and_smooth({
+            f"q_{group_name}": q_group, 
+            f"q_cmd_{group_name}": q_cmd_group
+        }, timestamps, dt, cfg)
+        q_f = filtered[f"q_{group_name}"]
+        q_cmd_f = filtered[f"q_cmd_{group_name}"]
+        dq = _gradient(q_f, dt)
+        ddq = _gradient(dq, dt)
+        q_err = q_cmd_f - q_f
+        
+        # Store group features
+        group_blocks[group_name] = np.concatenate([q_f, dq, ddq], axis=1)
+        group_blocks[f"command_{group_name}"] = np.concatenate([q_cmd_f, q_err], axis=1)
+        group_feature_names[group_name] = (
+            _channel_names(f"q_{group_name}", q_f.shape[1])
+            + _channel_names(f"dq_{group_name}", dq.shape[1])
+            + _channel_names(f"ddq_{group_name}", ddq.shape[1])
+        )
+        group_feature_names[f"command_{group_name}"] = (
+            _channel_names(f"q_cmd_{group_name}", q_cmd_f.shape[1])
+            + _channel_names(f"q_err_{group_name}", q_err.shape[1])
+        )
+    
+    # Handle case when no groups were processed
+    if not group_blocks:
+        # Return empty feature matrix
+        return {
+            "matrix": np.empty((len(timestamps), 0)),
+            "feature_names": [],
+            "timestamps": timestamps,
+            "source_channels": {"joint_groups": []},
+            "aux_signals": {
+                "original": {"timestamps": timestamps, "q": q, "q_cmd": q_cmd},
+                "resampled": {"timestamps": timestamps, "q_groups": {}},
+            },
+        }
+    
+    # Combine all groups
+    order = []
+    for group_name in cfg.joint_groups.keys():
+        if group_name in group_blocks:
+            order.append(group_name)
+        if f"command_{group_name}" in group_blocks:
+            order.append(f"command_{group_name}")
+    
+    matrix, feature_names = _finalize_blocks(group_blocks, group_feature_names, cfg, order)
+    
+    return {
+        "matrix": matrix,
+        "feature_names": feature_names,
+        "timestamps": t_rs,
+        "source_channels": {"joint_groups": list(cfg.joint_groups.keys())},
+        "aux_signals": {
+            "original": {"timestamps": timestamps, "q": q, "q_cmd": q_cmd},
+            "resampled": {"timestamps": t_rs, "q_groups": group_blocks},
         },
     }
 
@@ -527,4 +704,10 @@ def _finalize_blocks(
     feature_names: list[str] = []
     for name in order:
         feature_names.extend(block_feature_names.get(name, []))
+    
+    # Handle case when no matrices are available
+    if not matrices:
+        # Return empty array with appropriate shape
+        return np.empty((0, 0)), []
+    
     return np.concatenate(matrices, axis=1), feature_names

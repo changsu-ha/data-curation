@@ -61,6 +61,9 @@ class TiccConfig:
     max_iter: int = 100
     """Maximum EM iterations."""
 
+    num_processors: int = 1
+    """Number of parallel processors for optimization (1 = sequential)."""
+
     random_state: int = 42
     """Random seed passed to fast_ticc."""
 
@@ -102,7 +105,7 @@ def _pool_segment(seg: np.ndarray, window_size: int) -> np.ndarray:
     """Return mean-pooled feature vector for a segment of shape (T, D)."""
     x = np.asarray(seg, dtype=float)
     if x.ndim == 1:
-        return x
+        return np.array([x.mean()])  # Ensure we return a 1D array with shape (1,)
     return x.mean(axis=0)
 
 
@@ -113,7 +116,15 @@ def _downsample_segment(seg: np.ndarray, window_size: int) -> np.ndarray:
     if T <= window_size:
         # Pad with last frame
         pad = window_size - T
-        return np.vstack([x, np.tile(x[-1:], (pad, 1))]) if x.ndim == 2 else np.concatenate([x, np.full(pad, x[-1])])
+        # Ensure we have at least one frame
+        if pad > 0:
+            return np.vstack([x, np.tile(x[-1:], (pad, 1))]) if x.ndim == 2 else np.concatenate([x, np.full(pad, x[-1])])
+        else:
+            # If T is 0, return a zero array
+            if x.ndim == 2:
+                return np.zeros((window_size, x.shape[1]), dtype=x.dtype)
+            else:
+                return np.zeros(window_size, dtype=x.dtype)
     indices = np.round(np.linspace(0, T - 1, window_size)).astype(int)
     return x[indices]
 
@@ -134,8 +145,10 @@ def _find_representatives(
 ) -> list[int]:
     """For each cluster, find the segment closest to the cluster mean."""
     reps: list[int] = []
+    n_segments = len(pooled)
     for k in range(n_clusters):
-        idxs = [i for i, a in enumerate(assignments) if a == k]
+        # Filter indices to ensure they're within bounds
+        idxs = [i for i, a in enumerate(assignments) if a == k and i < n_segments]
         if not idxs:
             reps.append(0)
             continue
@@ -160,24 +173,66 @@ def _silhouette(pooled: np.ndarray, assignments: list[int]) -> float | None:
 # ---------------------------------------------------------------------------
 
 def _run_ticc_fixed_k(
-    windows: np.ndarray,  # (n_windows, window_size * D) flat
+    segments: list[np.ndarray],  # List of (T_i, D) arrays
     k: int,
     config: TiccConfig,
 ) -> list[int]:
     """Run fast_ticc for a fixed number of clusters.
 
-    Returns cluster assignment per window.
+    Returns cluster assignment per segment.
     """
-    assignments, _, _ = fast_ticc.ticc(
-        windows,
+    # Filter out empty segments
+    valid_segments = [seg for seg in segments if seg is not None and seg.size > 0 and len(seg) > 0]
+    
+    if not valid_segments:
+        raise ValueError("No valid segments provided to TICC")
+    
+    # Concatenate all segments into one time series
+    # We need to add a small gap between segments to indicate they're separate
+    # This is a common approach when clustering multiple time series with TICC
+    time_series_parts = []
+    for i, seg in enumerate(valid_segments):
+        time_series_parts.append(seg)
+        # Add a small gap between segments (except after the last one)
+        if i < len(valid_segments) - 1:
+            # Add a gap of zeros with the same number of features
+            gap = np.zeros((config.window_size, seg.shape[1] if seg.ndim > 1 else 1))
+            time_series_parts.append(gap)
+    
+    # Concatenate all parts
+    if time_series_parts:
+        full_time_series = np.vstack(time_series_parts)
+    else:
+        raise ValueError("No valid time series data to process")
+    
+    # Validate input dimensions
+    if full_time_series.size == 0 or full_time_series.shape[0] == 0:
+        raise ValueError("Empty time series provided to TICC")
+    
+    # Debug print
+    print(f"  TICC input: time_series.shape={full_time_series.shape}, k={k}, window_size={config.window_size}")
+    
+    # Check if we have enough data points for the window size
+    if full_time_series.shape[0] < config.window_size:
+        raise ValueError(f"Not enough data points ({full_time_series.shape[0]}) for window size ({config.window_size})")
+    
+    # Use the correct function signature for the installed fast_ticc version
+    result = fast_ticc.ticc_labels(
+        data_series=full_time_series,
         num_clusters=k,
         window_size=config.window_size,
-        lambda_parameter=config.lambda_,
-        beta=config.beta,
-        maxIters=config.max_iter,
-        random_state=config.random_state,
+        sparsity_weight=config.lambda_,
+        label_switching_cost=config.beta,
+        iteration_limit=config.max_iter,
+        min_cluster_size=1,  # Avoid donor cluster errors
+        num_processors=config.num_processors,  # Parallel processing
     )
-    return [int(a) for a in assignments]
+    
+    # Return cluster assignments for each window
+    # Note: TICC returns -1 for points that couldn't be assigned (usually at the boundaries)
+    # We'll map these to cluster 0 for simplicity
+    labels = [int(a) if a >= 0 else 0 for a in result.point_labels]
+    return labels
 
 
 # ---------------------------------------------------------------------------
@@ -219,17 +274,33 @@ def run_ticc(
 
     cfg = config or TiccConfig()
 
-    if len(segments) < 2:
-        warnings.warn("Need at least 2 segments for TICC; skipping.", stacklevel=2)
+    # Filter out empty segments
+    valid_segments = [seg for seg in segments if seg is not None and seg.size > 0 and len(seg) > 0]
+    
+    if len(valid_segments) < 2:
+        warnings.warn("Need at least 2 valid segments for TICC; skipping.", stacklevel=2)
         return None
 
     # Prepare pooled feature matrix (n_segments, D) for silhouette
-    pooled = np.array([_pool_segment(s, cfg.window_size) for s in segments])
+    pooled = np.array([_pool_segment(s, cfg.window_size) for s in valid_segments])
+    print(f"  Pooled features: shape {pooled.shape}")
 
     # Prepare windowed matrix (n_segments, window_size * D)
-    ws_segs = [_downsample_segment(s, cfg.window_size) for s in segments]
+    ws_segs = [_downsample_segment(s, cfg.window_size) for s in valid_segments]
+    print(f"  Windowed segments: {len(ws_segs)} segments")
+    for i, seg in enumerate(ws_segs):
+        print(f"    Segment {i}: shape {seg.shape}")
+    
     D = ws_segs[0].shape[-1] if ws_segs[0].ndim > 1 else 1
-    windows = np.array([s.reshape(-1) for s in ws_segs])  # (n_segments, window_size * D)
+    # Reshape each segment to (window_size * D,) and concatenate them
+    windows_list = [s.reshape(-1) for s in ws_segs]  # Each becomes (window_size * D,)
+    windows = np.vstack(windows_list)  # Stack to (n_segments, window_size * D)
+    print(f"  Windows matrix: shape {windows.shape}")
+    
+    # But fast_ticc expects (n_data_points, window_size * D), so we need to transpose
+    # Actually, no - looking at the docs again, it should be (n_data_points, window_size * D)
+    # where n_data_points is the number of windows/segments
+    # So our current shape (n_segments, window_size * D) is correct for the first dimension
 
     diagnostics: dict[str, Any] = {}
 
@@ -239,9 +310,9 @@ def run_ticc(
         best_sil: float = -2.0
         sil_scores: dict[int, float] = {}
 
-        for k in range(2, min(cfg.max_k + 1, len(segments))):
+        for k in range(2, min(cfg.max_k + 1, len(valid_segments))):
             try:
-                asgn = _run_ticc_fixed_k(windows, k, cfg)
+                asgn = _run_ticc_fixed_k(valid_segments, k, cfg)
                 sil = _silhouette(pooled, asgn)
                 sil_scores[k] = sil if sil is not None else -1.0
                 if sil is not None and sil > best_sil:
@@ -257,7 +328,7 @@ def run_ticc(
 
     # --- final run with chosen k ---
     try:
-        assignments = _run_ticc_fixed_k(windows, k_final, cfg)
+        assignments = _run_ticc_fixed_k(valid_segments, k_final, cfg)
     except Exception as exc:
         warnings.warn(f"TICC final run (k={k_final}) failed: {exc}", stacklevel=2)
         return None

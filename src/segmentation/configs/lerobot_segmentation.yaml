@@ -37,6 +37,39 @@ features:
     cartesian: 1.0
     command: 1.0
 
+  # Joint grouping configuration for RB-Y1 robot
+  # When specified, joints are processed in groups rather than as a single block
+  joint_groups:
+    torso:
+      - torso_0
+      - torso_1
+      - torso_2
+      - torso_3
+      - torso_4
+      - torso_5
+    right_arm:
+      - right_arm_0
+      - right_arm_1
+      - right_arm_2
+      - right_arm_3
+      - right_arm_4
+      - right_arm_5
+      - right_arm_6
+    left_arm:
+      - left_arm_0
+      - left_arm_1
+      - left_arm_2
+      - left_arm_3
+      - left_arm_4
+      - left_arm_5
+      - left_arm_6
+    right_gripper:
+      - gripper_finger_r1
+      - gripper_finger_r2
+    left_gripper:
+      - gripper_finger_l1
+      - gripper_finger_l2
+
 # ---------------------------------------------------------------------------
 # Ruptures change-point detection
 # ---------------------------------------------------------------------------
@@ -47,7 +80,7 @@ ruptures:
 
   # penalty: "auto" → elbow-based auto-selection from penalty_range.
   # Set to a float to use a fixed penalty (disables auto-selection).
-  penalty: auto
+  penalty: 10
   auto_method: elbow   # elbow is the only implemented method
 
   # Log-spaced search range for auto penalty selection.
@@ -64,11 +97,14 @@ ruptures:
 # fast_ticc primitive discovery
 # ---------------------------------------------------------------------------
 ticc:
+  # Enable/disable TICC processing (set to false to skip TICC entirely)
+  enabled: true
+  
   window_size: 10      # frames per TICC window; should match segment granularity
 
   # n_clusters: "auto" → silhouette search over 2..max_k
   # Set to an integer to use a fixed number of clusters.
-  n_clusters: auto
+  n_clusters: 3
   max_k: 10            # upper bound for auto search
 
   # Sparsity regularisation: higher → sparser inverse covariance graphs.
@@ -79,8 +115,15 @@ ticc:
   # Rationale: 400 is the fast_ticc default for robot tasks.
   beta: 400.0
 
-  max_iter: 100
+  max_iter: 50
   random_state: 42
+
+# ---------------------------------------------------------------------------
+# sktime benchmarking
+# ---------------------------------------------------------------------------
+sktime:
+  # Enable/disable sktime processing (set to false to skip sktime entirely)
+  enabled: true
 
 # ---------------------------------------------------------------------------
 # Evaluation
