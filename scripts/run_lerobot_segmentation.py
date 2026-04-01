@@ -106,6 +106,7 @@ def _build_feature_config(cfg: dict[str, Any], dt_override: float | None) -> Fea
         normalize=section.get("normalize", "mad"),
         modality_weights=section.get("modality_weights"),
         joint_groups=section.get("joint_groups"),
+        joint_weights=section.get("joint_weights"),
     )
 
 
@@ -159,6 +160,7 @@ def _plot_segmentation(
     feature_names: list[str] | None = None,
     joint_groups: dict[str, list[str]] | None = None,
     show_interactive: bool = False,
+    raw_matrices: dict[str, np.ndarray] | None = None,
 ) -> None:
     """Plot segmentation results. If joint_groups are provided, create separate plots for each group."""
     
@@ -179,6 +181,60 @@ def _plot_segmentation(
             group_save_path = save_path.parent / f"{save_path.stem}_{group_name}{save_path.suffix}"
             # Extract feature names for this group
             group_feature_names = [feature_names[i] for i in indices] if feature_names else None
+            
+            # For joint_command modality, also create separate plots for different feature types
+            if modality == "joint_command" and group_feature_names:
+                # Separate features by type
+                state_indices = [i for i, name in enumerate(group_feature_names) if name.startswith('q_') and not name.startswith(('q_cmd_', 'q_err_'))]
+                command_indices = [i for i, name in enumerate(group_feature_names) if name.startswith('q_cmd_')]
+                
+                # Create separate plots for state features using raw values
+                if state_indices:
+                    state_save_path = save_path.parent / f"{save_path.stem}_{group_name}_state{save_path.suffix}"
+                    state_features = [group_feature_names[i] for i in state_indices]
+                    
+                    # Use raw values if available, otherwise use normalized values
+                    if raw_matrices and f"{group_name}_state" in raw_matrices:
+                        state_signal = raw_matrices[f"{group_name}_state"]
+                    else:
+                        state_signal = signal_2d[np.ix_(range(signal_2d.shape[0]), [indices[i] for i in state_indices])]
+                    
+                    _plot_segmentation_group(
+                        timestamps, 
+                        state_signal, 
+                        boundary_results, 
+                        episode_id, 
+                        modality, 
+                        state_save_path, 
+                        group_name,
+                        show_interactive,
+                        state_features
+                    )
+                
+                # Create separate plots for command features using raw values
+                if command_indices:
+                    command_save_path = save_path.parent / f"{save_path.stem}_{group_name}_command{save_path.suffix}"
+                    command_features = [group_feature_names[i] for i in command_indices]
+                    
+                    # Use raw values if available, otherwise use normalized values
+                    if raw_matrices and f"{group_name}_command" in raw_matrices:
+                        command_signal = raw_matrices[f"{group_name}_command"]
+                    else:
+                        command_signal = signal_2d[np.ix_(range(signal_2d.shape[0]), [indices[i] for i in command_indices])]
+                    
+                    _plot_segmentation_group(
+                        timestamps, 
+                        command_signal, 
+                        boundary_results, 
+                        episode_id, 
+                        modality, 
+                        command_save_path, 
+                        group_name,
+                        show_interactive,
+                        command_features
+                    )
+            
+            # Create the combined plot
             _plot_segmentation_group(
                 timestamps, 
                 signal_2d[:, indices], 
@@ -225,7 +281,26 @@ def _plot_segmentation_combined(
     n_dims = min(3, signal_2d.shape[1])
     n_methods = len(boundary_results)
     fig, axes = plt.subplots(n_dims + 1, 1, figsize=(14, 3 * (n_dims + 1)), sharex=True)
-    colors = plt.cm.tab10(np.linspace(0, 1, max(n_methods, 1)))
+    
+    # Use more distinguishable colors for PELT and BinSeg
+    # Define specific colors and line styles for better visibility
+    method_colors = {
+        "pelt": "#1f77b4",      # Blue
+        "binseg": "#ff7f0e",    # Orange
+        "sktime_ClaSP": "#2ca02c",  # Green
+        "sktime_GGS": "#d62728",    # Red
+    }
+    
+    method_linestyles = {
+        "pelt": "-",            # Solid line
+        "binseg": "--",         # Dotted line
+        "sktime_ClaSP": "-",    # Solid line
+        "sktime_GGS": "-",      # Solid line
+    }
+    
+    # Create color and linestyle lists in the order of methods in boundary_results
+    colors = [method_colors.get(method.lower(), plt.cm.tab10(i)) for i, method in enumerate(boundary_results.keys())]
+    linestyles = [method_linestyles.get(method.lower(), "-") for i, method in enumerate(boundary_results.keys())]
 
     # Handle case where there's only one subplot (axes is not an array)
     if n_dims + 1 == 1:
@@ -250,14 +325,15 @@ def _plot_segmentation_combined(
                     ax.axvline(
                         timestamps[boundary],
                         color=colors[color_idx],
-                        alpha=0.6,
-                        linewidth=1.2,
+                        alpha=0.7,  # Increased alpha for better visibility
+                        linewidth=1.5,  # Increased line width
+                        linestyle=linestyles[color_idx],  # Different line styles
                         label=method if idx == 0 else None,
                     )
         ax.set_ylabel(f"dim {idx}", fontsize=9)
         ax.grid(True, alpha=0.25)
         if idx == 0 and n_methods > 0:
-            ax.legend(loc="upper right", fontsize=7, ncol=max(1, min(n_methods, 4)))
+            ax.legend(loc="upper right", fontsize=8, ncol=max(1, min(n_methods, 4)))
 
     ax_bar = axes[-1]
     ax_bar.bar(list(boundary_results.keys()), [len(bounds) + 1 for bounds in boundary_results.values()], color=colors[:n_methods])
@@ -297,7 +373,7 @@ def _plot_segmentation_group(
     feature_names: list[str] | None = None,
 ) -> None:
     """Create segmentation plot for a specific joint group."""
-    # For joint groups, show all dimensions but organize in 2 columns for better visualization
+    # For joint groups, show all dimensions but organize in columns for better visualization
     n_dims = signal_2d.shape[1]  # Show all dimensions
     
     # For hand groups, we want to show all joints, so we don't limit the dimensions
@@ -311,20 +387,49 @@ def _plot_segmentation_group(
     
     n_methods = len(boundary_results)
     
-    # Create 2-column layout
-    n_cols = 2
-    n_rows = (n_dims + 1) // n_cols + 1  # +1 for the bar chart row
+    # Create layout based on group type and degrees of freedom
+    # Torso (6 DOF): 1 column
+    # Arms (7 DOF): 1 column
+    # Hands (12 DOF): 2 columns
+    if "torso" in group_name.lower():
+        n_cols = 1  # Torso: 6 joints -> 1 column
+    elif "arm" in group_name.lower():
+        n_cols = 1  # Arms: 7 joints -> 1 column
+    elif "hand" in group_name.lower():
+        n_cols = 2  # Hands: 12 joints -> 2 columns
+    else:
+        n_cols = 2  # Default to 2 columns for other groups
+    
+    n_rows = (n_dims + n_cols - 1) // n_cols + 1  # +1 for the bar chart row
     
     # Calculate figure size based on number of subplots
-    fig_width = 14
-    fig_height = 3 * ((n_dims + 1) // n_cols + 1)
+    fig_width = max(12, n_cols * 8)  # Minimum width of 12, then 8 per column
+    fig_height = 3 * ((n_dims + n_cols - 1) // n_cols + 1)
     fig = plt.figure(figsize=(fig_width, fig_height))
     
     # Create a grid for subplots
     from matplotlib.gridspec import GridSpec
-    gs = GridSpec((n_dims + 1) // n_cols + 1, n_cols, figure=fig, hspace=0.3)
+    gs = GridSpec((n_dims + n_cols - 1) // n_cols + 1, n_cols, figure=fig, hspace=0.3)
     
-    colors = plt.cm.tab10(np.linspace(0, 1, max(n_methods, 1)))
+    # Use more distinguishable colors for PELT and BinSeg
+    # Define specific colors and line styles for better visibility
+    method_colors = {
+        "pelt": "#1f77b4",      # Blue
+        "binseg": "#ff7f0e",    # Orange
+        "sktime_ClaSP": "#2ca02c",  # Green
+        "sktime_GGS": "#d62728",    # Red
+    }
+    
+    method_linestyles = {
+        "pelt": "-",            # Solid line
+        "binseg": "--",         # Dotted line
+        "sktime_ClaSP": "-",    # Solid line
+        "sktime_GGS": "-",      # Solid line
+    }
+    
+    # Create color and linestyle lists in the order of methods in boundary_results
+    colors = [method_colors.get(method.lower(), plt.cm.tab10(i)) for i, method in enumerate(boundary_results.keys())]
+    linestyles = [method_linestyles.get(method.lower(), "-") for i, method in enumerate(boundary_results.keys())]
     
     # Plot each dimension with autonomous y-axis scaling
     axes = []
@@ -349,8 +454,9 @@ def _plot_segmentation_group(
                     ax.axvline(
                         timestamps[boundary],
                         color=colors[color_idx],
-                        alpha=0.6,
-                        linewidth=1.2,
+                        alpha=0.7,  # Increased alpha for better visibility
+                        linewidth=1.5,  # Increased line width
+                        linestyle=linestyles[color_idx],  # Different line styles
                         label=method if idx == 0 else None,
                     )
         
@@ -365,10 +471,10 @@ def _plot_segmentation_group(
         
         ax.grid(True, alpha=0.25)
         if idx == 0 and n_methods > 0:
-            ax.legend(loc="upper right", fontsize=7, ncol=max(1, min(n_methods, 4)))
+            ax.legend(loc="upper right", fontsize=8, ncol=max(1, min(n_methods, 4)))
 
     # Add bar chart for segment counts
-    ax_bar = fig.add_subplot(gs[(n_dims + 1) // n_cols, :])  # Span both columns
+    ax_bar = fig.add_subplot(gs[(n_dims + n_cols - 1) // n_cols, :])  # Span all columns
     ax_bar.bar(list(boundary_results.keys()), [len(bounds) + 1 for bounds in boundary_results.values()], color=colors[:n_methods])
     ax_bar.set_ylabel("# segments", fontsize=9)
     ax_bar.set_xlabel("Method", fontsize=9)
@@ -642,6 +748,7 @@ def _process_episode(
                 feature_names=feat_out.get("feature_names"),
                 joint_groups=feat_config.joint_groups,
                 show_interactive=show_plots,
+                raw_matrices=feat_out.get("raw_matrices"),
             )
 
         ep_results["modalities"][modality] = mod_results

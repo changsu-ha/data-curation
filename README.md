@@ -727,6 +727,13 @@ When joint groups are specified:
 * Results are more interpretable as they relate to specific robot components
 * Separate visualization plots are generated for each joint group
 
+### Enhanced Visualization
+
+The pipeline now generates separate plots for each joint group with optimized layouts:
+* **Torso group (6 DOF)**: 1 column layout for better vertical scanning
+* **Arm groups (7 DOF)**: 1 column layout for better vertical scanning
+* **Hand groups (12 DOF)**: 2 column layout for better organization
+
 ### Modular Workflow
 
 The pipeline now supports a modular workflow where users can run rupture analysis first and then optionally run TICC and sktime analysis:
@@ -742,14 +749,36 @@ python scripts/run_lerobot_segmentation.py --dataset /path/to/dataset --local --
 python scripts/run_lerobot_segmentation.py --dataset /path/to/dataset --local --n-episodes 1 --modalities joint --output results --show-plots
 ```
 
-### Enhanced Visualization
+### Separate Plot Generation
 
-The pipeline now generates separate plots for each joint group:
-* `segmentation_joint.png` - Combined overview plot
-* `segmentation_joint_torso.png` - Torso group plot
-* `segmentation_joint_right_arm.png` - Right arm group plot
-* `segmentation_joint_left_arm.png` - Left arm group plot
-* `segmentation_joint_right_hand_fingers.png` - Right hand fingers group plot
-* `segmentation_joint_left_hand_fingers.png` - Left hand fingers group plot
+When using `--modality joint_command`, the pipeline generates separate plots for different feature types:
 
-Each plot shows up to 18 dimensions for better visualization of all features in each group.
+* `segmentation_joint_command.png` - Combined overview plot (normalized values)
+* `segmentation_joint_command_[group].png` - Combined group plot (normalized values)
+* `segmentation_joint_command_[group]_state.png` - Joint state features (raw values)
+* `segmentation_joint_command_[group]_command.png` - Joint command features (raw values)
+
+The separate plots show actual raw values from the dataset for better interpretability, while combined plots still use normalized values for segmentation algorithms.
+
+### Rupture Detection Configuration
+
+The pipeline supports various rupture detection models and parameters:
+
+```yaml
+ruptures:
+  model: rbf        # rbf | l2 | l1 | cosine
+  penalty: auto     # "auto" for elbow method, or fixed float value
+  min_size: 5       # Minimum segment size in frames
+  max_n_bkps: 30    # Maximum number of breakpoints
+```
+
+### Normalization Options
+
+Different normalization methods are available for feature scaling:
+
+```yaml
+features:
+  normalize: mad    # mad | iqr | none
+```
+
+When `normalize: none` is used, all plots show raw values directly from the dataset.

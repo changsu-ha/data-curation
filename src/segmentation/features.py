@@ -35,6 +35,7 @@ class FeatureBuildConfig:
     normalize: str = "mad"  # mad | iqr | none
     modality_weights: Optional[Mapping[str, float]] = None
     joint_groups: Optional[Mapping[str, list[str]]] = None  # Group name -> list of joint names
+    joint_weights: Optional[Mapping[str, float]] = None  # Joint name -> weight
 
 
 def normalize_modality_name(modality: str) -> str:
@@ -187,6 +188,7 @@ def build_features(
         "timestamps": built["timestamps"],
         "source_channels": built["source_channels"],
         "aux_signals": built["aux_signals"],
+        "raw_matrices": built.get("raw_matrices", {}),  # Include raw matrices if available
     }
 
 
@@ -389,6 +391,7 @@ def _build_grouped_joint_command_features(
     # Build features for each group
     group_blocks = {}
     group_feature_names = {}
+    raw_group_blocks = {}  # Store raw (unnormalized) values
     
     # Initialize t_rs with the original timestamps (will be updated if we process groups)
     t_rs = timestamps
@@ -414,7 +417,7 @@ def _build_grouped_joint_command_features(
         ddq = _gradient(dq, dt)
         q_err = q_cmd_f - q_f
         
-        # Store group features
+        # Store group features (normalized)
         group_blocks[group_name] = np.concatenate([q_f, dq, ddq], axis=1)
         group_blocks[f"command_{group_name}"] = np.concatenate([q_cmd_f, q_err], axis=1)
         group_feature_names[group_name] = (
@@ -426,6 +429,12 @@ def _build_grouped_joint_command_features(
             _channel_names(f"q_cmd_{group_name}", q_cmd_f.shape[1])
             + _channel_names(f"q_err_{group_name}", q_err.shape[1])
         )
+        
+        # Store raw (unnormalized) values for separate plotting
+        # For state features (q, dq, ddq)
+        raw_group_blocks[f"{group_name}_state"] = np.concatenate([q_group, dq, ddq], axis=1)
+        # For command features (q_cmd, q_err)
+        raw_group_blocks[f"{group_name}_command"] = np.concatenate([q_cmd_group, q_err], axis=1)
     
     # Handle case when no groups were processed
     if not group_blocks:
@@ -439,6 +448,7 @@ def _build_grouped_joint_command_features(
                 "original": {"timestamps": timestamps, "q": q, "q_cmd": q_cmd},
                 "resampled": {"timestamps": timestamps, "q_groups": {}},
             },
+            "raw_matrices": {},
         }
     
     # Combine all groups
@@ -460,6 +470,7 @@ def _build_grouped_joint_command_features(
             "original": {"timestamps": timestamps, "q": q, "q_cmd": q_cmd},
             "resampled": {"timestamps": t_rs, "q_groups": group_blocks},
         },
+        "raw_matrices": raw_group_blocks,  # Include raw matrices for separate plotting
     }
 
 
@@ -693,13 +704,71 @@ def _normalize_and_weight(
     return out
 
 
+def _normalize_and_weight_raw(
+    modalities: Mapping[str, Array],
+    mode: str,
+    modality_weights: Optional[Mapping[str, float]],
+) -> Dict[str, Array]:
+    """Apply normalization and weighting but also return raw (unnormalized) values."""
+    weights = {"joint": 1.0, "cartesian": 1.0, "command": 1.0}
+    if modality_weights:
+        weights.update({k: float(v) for k, v in modality_weights.items()})
+
+    out: Dict[str, Array] = {}
+    raw: Dict[str, Array] = {}
+    for name, x in modalities.items():
+        x_array = np.asarray(x, dtype=float)
+        out[name] = _robust_scale(x_array, mode) * weights.get(name, 1.0)
+        # Store raw values (unnormalized but with weights applied)
+        raw[name] = x_array * weights.get(name, 1.0)
+    return out, raw
+
+
+def _apply_joint_weights(
+    matrix: Array,
+    feature_names: list[str],
+    joint_weights: Optional[Mapping[str, float]],
+) -> Array:
+    """Apply joint-specific weights to the feature matrix."""
+    if not joint_weights:
+        return matrix
+    
+    # Create a copy of the matrix to avoid modifying the original
+    weighted_matrix = matrix.copy()
+    
+    # Apply weights to each feature based on joint name in feature name
+    for i, feature_name in enumerate(feature_names):
+        # Extract joint name from feature name (e.g., "q_right_arm_3" -> "right_arm_3")
+        # Feature names are in format: "q_{joint_name}_{index}" or "dq_{joint_name}_{index}" or "ddq_{joint_name}_{index}"
+        if "_" in feature_name:
+            parts = feature_name.split("_")
+            if len(parts) >= 3:
+                # Try to match joint names with different levels of specificity
+                # Start with the most specific (full joint name) and work backwards
+                for j in range(len(parts) - 1, 1, -1):
+                    joint_candidate = "_".join(parts[1:j+1])
+                    if joint_candidate in joint_weights:
+                        weighted_matrix[:, i] *= joint_weights[joint_candidate]
+                        break
+                # Also try individual joint names
+                for part in parts[1:]:
+                    if part in joint_weights:
+                        weighted_matrix[:, i] *= joint_weights[part]
+                        break
+    
+    return weighted_matrix
+
+
 def _finalize_blocks(
     blocks: Mapping[str, Array],
     block_feature_names: Mapping[str, list[str]],
     cfg: FeatureBuildConfig,
     order: list[str],
 ) -> tuple[Array, list[str]]:
-    normalized = _normalize_and_weight(blocks, cfg.normalize, cfg.modality_weights)
+    # Get both normalized and raw values
+    normalized, raw = _normalize_and_weight_raw(blocks, cfg.normalize, cfg.modality_weights)
+    
+    # Use normalized values for the main matrix (for segmentation algorithms)
     matrices = [normalized[name] for name in order if name in normalized]
     feature_names: list[str] = []
     for name in order:
@@ -710,4 +779,11 @@ def _finalize_blocks(
         # Return empty array with appropriate shape
         return np.empty((0, 0)), []
     
-    return np.concatenate(matrices, axis=1), feature_names
+    # Concatenate matrices
+    matrix = np.concatenate(matrices, axis=1)
+    
+    # Apply joint weights if specified
+    if cfg.joint_weights:
+        matrix = _apply_joint_weights(matrix, feature_names, cfg.joint_weights)
+    
+    return matrix, feature_names
